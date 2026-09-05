@@ -1,5 +1,20 @@
 import re
-from typing import Any
+from typing import Any, Callable
+
+
+# ============================================================
+# SMARTLABEL AI - INFORMATION EXTRACTION ENGINE
+# ============================================================
+#
+# Design principles:
+# 1. Never modify the original PaddleOCR detection structure.
+# 2. Prefer explicit field labels over global regex matching.
+# 3. Use spatial proximity when labels and values are separate.
+# 4. Never hardcode specific product names.
+# 5. Preserve company <-> licence relationships where possible.
+# 6. Extraction is NOT compliance. Compliance engine decides that.
+#
+# ============================================================
 
 
 # ============================================================
@@ -7,7 +22,6 @@ from typing import Any
 # ============================================================
 
 def _clean_text(text: str) -> str:
-    """Normalize OCR text for easier matching."""
     text = str(text or "")
     text = text.replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
@@ -15,44 +29,70 @@ def _clean_text(text: str) -> str:
 
 
 def _normalize_ocr_text(text: str) -> str:
-    """Normalize common OCR mistakes and label variations."""
+    """
+    Normalize common OCR/label variations.
+
+    Important:
+    This creates normalized_text only.
+    Original `text` is preserved.
+    """
 
     text = _clean_text(text)
 
     replacements = {
+        # Price
         "M.R.P.": "MRP",
         "M.R.P": "MRP",
         "M R P": "MRP",
+        "M.R.P": "MRP",
 
+        # FSSAI
         "LIC. NO.": "LIC NO",
         "LIC. NO": "LIC NO",
         "LIC.NO": "LIC NO",
+        "LIC NO.": "LIC NO",
+        "LICENSE NO.": "LICENSE NO",
 
+        # Batch
         "BATCH NO.": "BATCH NO",
         "BATCH NO": "BATCH NO",
-
         "LOT NO.": "LOT NO",
         "LOT NO": "LOT NO",
 
-        "USE BY DATE:": "USE BY DATE",
+        # Dates
         "DATE OF EXPIRY:": "DATE OF EXPIRY",
         "DATE OF EXPIRY": "DATE OF EXPIRY",
-
+        "DATE OF EXP:": "DATE OF EXP",
         "DATE OF MFG:": "DATE OF MFG",
         "DATE OF MANUFACTURE:": "DATE OF MANUFACTURE",
+        "DATE OF MFG": "DATE OF MFG",
 
+        # Business roles
+        "MANUFACTURED BY": "MANUFACTURED BY",
+        "MANUFACTURER:": "MANUFACTURER",
         "PACKED BY": "PACKED BY",
         "PACKED AT": "PACKED AT",
-
         "MARKETED BY": "MARKETED BY",
-        "MANUFACTURED BY": "MANUFACTURED BY",
+        "IMPORTED BY": "IMPORTED BY",
 
+        # Quantity
         "NET QTY": "NET QUANTITY",
+        "NET QTY.": "NET QUANTITY",
+        "N.QTY": "NET QUANTITY",
+        "N.QTY:": "NET QUANTITY",
         "NET WT": "NET WEIGHT",
+        "NET WT.": "NET WEIGHT",
 
+        # Consumer care
         "CUST CARE": "CUSTOMER CARE",
         "CUSTOMER CARE NO": "CUSTOMER CARE",
         "CONSUMER CARE": "CUSTOMER CARE",
+        "CONSUMER CARE DETAILS": "CUSTOMER CARE",
+
+        # Generic name
+        "NAME OF COMMODITY": "NAME OF COMMODITY",
+        "COMMON NAME": "COMMON NAME",
+        "GENERIC NAME": "GENERIC NAME",
     }
 
     for old, new in replacements.items():
@@ -61,39 +101,96 @@ def _normalize_ocr_text(text: str) -> str:
     return text
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ============================================================
 # BOUNDING BOX
 # ============================================================
 
-def _bbox_info(bbox):
-    """Return x/y center and dimensions from PaddleOCR bbox."""
+def _bbox_info(bbox: Any) -> dict[str, float] | None:
+    """
+    Supports both:
 
-    if not bbox or len(bbox) < 4:
+        [x1, y1, x2, y2]
+
+    and PaddleOCR polygon:
+
+        [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+    """
+
+    if not bbox:
         return None
 
     try:
-        xs = [float(point[0]) for point in bbox]
-        ys = [float(point[1]) for point in bbox]
+        # Flat bbox: [x1, y1, x2, y2]
+        if (
+            isinstance(bbox, (list, tuple))
+            and len(bbox) == 4
+            and all(
+                isinstance(v, (int, float))
+                for v in bbox
+            )
+        ):
+            x1, y1, x2, y2 = map(float, bbox)
 
-        x1 = min(xs)
-        x2 = max(xs)
-        y1 = min(ys)
-        y2 = max(ys)
+            return {
+                "x1": min(x1, x2),
+                "x2": max(x1, x2),
+                "y1": min(y1, y2),
+                "y2": max(y1, y2),
+                "cx": (x1 + x2) / 2,
+                "cy": (y1 + y2) / 2,
+                "width": abs(x2 - x1),
+                "height": abs(y2 - y1),
+            }
 
-        return {
-            "x1": x1,
-            "x2": x2,
-            "y1": y1,
-            "y2": y2,
-            "cx": (x1 + x2) / 2,
-            "cy": (y1 + y2) / 2,
-            "width": x2 - x1,
-            "height": y2 - y1,
-        }
+        # Polygon bbox
+        if (
+            isinstance(bbox, (list, tuple))
+            and len(bbox) >= 4
+        ):
+            xs = []
+            ys = []
+
+            for point in bbox:
+                if (
+                    isinstance(point, (list, tuple))
+                    and len(point) >= 2
+                ):
+                    xs.append(float(point[0]))
+                    ys.append(float(point[1]))
+
+            if len(xs) >= 2:
+                x1 = min(xs)
+                x2 = max(xs)
+                y1 = min(ys)
+                y2 = max(ys)
+
+                return {
+                    "x1": x1,
+                    "x2": x2,
+                    "y1": y1,
+                    "y2": y2,
+                    "cx": (x1 + x2) / 2,
+                    "cy": (y1 + y2) / 2,
+                    "width": x2 - x1,
+                    "height": y2 - y1,
+                }
 
     except (TypeError, ValueError, IndexError):
         return None
 
+    return None
+
+
+# ============================================================
+# OCR PREPARATION
+# ============================================================
 
 def _prepare_detections(
     ocr_results: list[dict[str, Any]]
@@ -111,15 +208,15 @@ def _prepare_detections(
             continue
 
         bbox = item.get("bbox")
+
         info = _bbox_info(bbox)
 
-        try:
-            confidence = float(
-                item.get("confidence", 0)
-            )
-        except (TypeError, ValueError):
-            confidence = 0.0
+        confidence = _safe_float(
+            item.get("confidence", 0)
+        )
 
+        # IMPORTANT:
+        # Preserve exact structure expected by existing system.
         detections.append(
             {
                 "text": text,
@@ -139,7 +236,11 @@ def _prepare_detections(
 
 DATE_PATTERN = (
     r"\b"
-    r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
+    r"(?:0?[1-9]|[12]\d|3[01])"
+    r"[/-]"
+    r"(?:0?[1-9]|1[0-2])"
+    r"[/-]"
+    r"(?:\d{2}|\d{4})"
     r"\b"
 )
 
@@ -151,34 +252,47 @@ MONTH_YEAR_PATTERN = (
     r"\b"
 )
 
+MONTH_NAME_YEAR_PATTERN = (
+    r"\b"
+    r"(?:JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|"
+    r"APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|"
+    r"AUG(?:UST)?|SEP(?:T(?:EMBER)?)?|"
+    r"OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)"
+    r"\s+\d{4}\b"
+)
+
 WEIGHT_PATTERN = (
     r"\b\d+(?:\.\d+)?\s*"
     r"(?:mg|g|kg|ml|l|"
-    r"milligram|milligrams|"
-    r"gram|grams|"
-    r"kilogram|kilograms|"
-    r"millilitre|millilitres|"
-    r"milliliter|milliliters|"
-    r"litre|litres|liter|liters)"
+    r"milligram(?:s)?|"
+    r"gram(?:s)?|"
+    r"kilogram(?:s)?|"
+    r"millilitre(?:s)?|"
+    r"milliliter(?:s)?|"
+    r"litre(?:s)?|"
+    r"liter(?:s)?)"
     r"\b"
+)
+
+COMPOUND_QUANTITY_PATTERN = (
+    r"\b\d+(?:\.\d+)?\s*(?:g|kg|ml|l)"
+    r"(?:\s*\([^)]{1,100}\))?"
 )
 
 DIMENSION_PATTERN = (
     r"\b"
-    r"\d+(?:\.\d+)?"
-    r"\s*(?:mm|cm|m)"
+    r"\d+(?:\.\d+)?\s*(?:mm|cm|m)"
     r"(?:\s*[xX×]\s*"
-    r"\d+(?:\.\d+)?"
-    r"\s*(?:mm|cm|m))+"
+    r"\d+(?:\.\d+)?\s*(?:mm|cm|m))+"
     r"\b"
 )
 
 BATCH_PATTERN = (
-    r"\b[A-Z0-9][A-Z0-9/\-]{3,30}\b"
+    r"\b[A-Z0-9][A-Z0-9./\-_]{2,40}\b"
 )
 
 LICENSE_PATTERN = (
-    r"\b\d{8,20}\b"
+    r"\b\d{14}\b"
 )
 
 PIN_PATTERN = (
@@ -197,10 +311,12 @@ EMAIL_PATTERN = (
 
 
 # ============================================================
-# GENERIC EXTRACTORS
+# DATE HELPERS
 # ============================================================
 
 def _extract_date(text: str) -> str | None:
+
+    text = _clean_text(text)
 
     match = re.search(
         DATE_PATTERN,
@@ -214,21 +330,45 @@ def _extract_date(text: str) -> str | None:
     return None
 
 
-def _extract_month_year(text: str) -> str | None:
+def _extract_any_date(text: str) -> str | None:
+
+    text = _clean_text(text)
+
+    for pattern in (
+        DATE_PATTERN,
+        MONTH_NAME_YEAR_PATTERN,
+        MONTH_YEAR_PATTERN,
+    ):
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE,
+        )
+
+        if match:
+            return match.group(0)
+
+    return None
+
+
+# ============================================================
+# QUANTITY HELPERS
+# ============================================================
+
+def _extract_weight(text: str) -> str | None:
+
+    text = _clean_text(text)
 
     match = re.search(
-        MONTH_YEAR_PATTERN,
+        COMPOUND_QUANTITY_PATTERN,
         text,
         re.IGNORECASE,
     )
 
     if match:
-        return match.group(0)
-
-    return None
-
-
-def _extract_weight(text: str) -> str | None:
+        return _clean_text(
+            match.group(0)
+        )
 
     match = re.search(
         WEIGHT_PATTERN,
@@ -260,6 +400,10 @@ def _extract_dimension(text: str) -> str | None:
     return None
 
 
+# ============================================================
+# PRICE
+# ============================================================
+
 def _extract_mrp(text: str) -> str | None:
 
     text = _normalize_ocr_text(text)
@@ -267,29 +411,23 @@ def _extract_mrp(text: str) -> str | None:
     patterns = [
 
         # MRP ₹299
-        (
-            r"\bM\.?\s*R\.?\s*P\.?\b"
-            r"\s*[:\-]?\s*"
-            r"(?:₹|Rs\.?|INR)"
-            r"\s*"
-            r"([0-9]+(?:\.[0-9]{1,2})?)"
-        ),
+        r"\bMRP\b"
+        r"\s*[:\-]?\s*"
+        r"(?:₹|Rs\.?|INR)"
+        r"\s*"
+        r"([0-9]+(?:\.[0-9]{1,2})?)",
 
         # MRP 299
-        (
-            r"\bM\.?\s*R\.?\s*P\.?\b"
-            r"\s*[:\-]?\s*"
-            r"([0-9]+(?:\.[0-9]{1,2})?)"
-        ),
+        r"\bMRP\b"
+        r"\s*[:\-]?\s*"
+        r"([0-9]+(?:\.[0-9]{1,2})?)",
 
-        # MRP Rs 299
-        (
-            r"\bMRP\b"
-            r".{0,20}?"
-            r"(?:₹|Rs\.?|INR)"
-            r"\s*"
-            r"([0-9]+(?:\.[0-9]{1,2})?)"
-        ),
+        # Maximum Retail Price ₹299
+        r"\bMAXIMUM\s+RETAIL\s+PRICE\b"
+        r".{0,20}?"
+        r"(?:₹|Rs\.?|INR)"
+        r"\s*"
+        r"([0-9]+(?:\.[0-9]{1,2})?)",
     ]
 
     for pattern in patterns:
@@ -301,9 +439,7 @@ def _extract_mrp(text: str) -> str | None:
         )
 
         if match:
-
             try:
-
                 value = float(
                     match.group(1)
                 )
@@ -324,14 +460,10 @@ def _extract_price_with_currency(
     text: str,
 ) -> str | None:
 
-    pattern = (
+    match = re.search(
         r"(?:₹|Rs\.?|INR)"
         r"\s*"
-        r"([0-9]+(?:\.[0-9]{1,2})?)"
-    )
-
-    match = re.search(
-        pattern,
+        r"([0-9]+(?:\.[0-9]{1,2})?)",
         text,
         re.IGNORECASE,
     )
@@ -343,77 +475,979 @@ def _extract_price_with_currency(
 
 
 # ============================================================
-# BATCH / LOT
+# LABEL MATCHING
 # ============================================================
 
-def _extract_batch(text: str) -> str | None:
+def _matches_any(
+    text: str,
+    patterns: list[str],
+) -> bool:
 
-    text = _clean_text(text)
-
-    cleaned = re.sub(
-        r"\b(?:BATCH|LOT)\s*"
-        r"(?:NO|NUMBER|CODE)?\.?"
-        r"\s*[:\-]?\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    ).strip()
-
-    if re.fullmatch(
-        DATE_PATTERN,
-        cleaned,
-        re.IGNORECASE,
-    ):
-        return None
-
-    candidates = re.findall(
-        BATCH_PATTERN,
-        cleaned,
-        re.IGNORECASE,
+    return any(
+        re.search(
+            pattern,
+            text,
+            re.IGNORECASE,
+        )
+        for pattern in patterns
     )
 
-    for candidate in candidates:
 
-        candidate = candidate.strip(
-            " .,:;"
+# ============================================================
+# SPATIAL DISTANCE
+# ============================================================
+
+def _same_line(
+    a: dict[str, Any],
+    b: dict[str, Any],
+) -> bool:
+
+    box_a = a.get("_bbox")
+    box_b = b.get("_bbox")
+
+    if not box_a or not box_b:
+        return False
+
+    tolerance = max(
+        18,
+        min(
+            box_a["height"],
+            box_b["height"],
+        ) * 1.5,
+    )
+
+    return (
+        abs(
+            box_a["cy"] - box_b["cy"]
+        )
+        <= tolerance
+    )
+
+
+def _horizontal_gap(
+    a: dict[str, Any],
+    b: dict[str, Any],
+) -> float:
+
+    box_a = a.get("_bbox")
+    box_b = b.get("_bbox")
+
+    if not box_a or not box_b:
+        return 999999
+
+    return box_b["x1"] - box_a["x2"]
+
+
+# ============================================================
+# NEARBY VALUE
+# ============================================================
+
+def _find_nearby_value(
+    detections: list[dict[str, Any]],
+    label_index: int,
+    extractor: Callable[[str], str | None],
+    max_vertical_distance: float = 220,
+) -> str | None:
+
+    label = detections[label_index]
+    label_box = label.get("_bbox")
+
+    # First: value inside same OCR detection.
+    direct_value = extractor(
+        label["text"]
+    )
+
+    if direct_value:
+        return direct_value
+
+    if not label_box:
+        return None
+
+    candidates = []
+
+    for i, candidate in enumerate(
+        detections
+    ):
+
+        if i == label_index:
+            continue
+
+        candidate_box = candidate.get(
+            "_bbox"
         )
 
+        if not candidate_box:
+            continue
+
+        value = extractor(
+            candidate["text"]
+        )
+
+        if not value:
+            continue
+
+        dy = abs(
+            candidate_box["cy"]
+            - label_box["cy"]
+        )
+
+        dx = (
+            candidate_box["cx"]
+            - label_box["cx"]
+        )
+
+        if dy > max_vertical_distance:
+            continue
+
+        score = 999999
+
+        # ----------------------------------------
+        # Same line, value to right
+        # ----------------------------------------
+
         if (
-            len(candidate) >= 4
-            and any(
-                char.isdigit()
-                for char in candidate
+            dy <= max(
+                25,
+                label_box["height"] * 1.5,
             )
-            and not re.fullmatch(
-                DATE_PATTERN,
-                candidate,
-                re.IGNORECASE,
-            )
+            and dx >= -40
         ):
-            return candidate
+
+            gap = max(
+                0,
+                candidate_box["x1"]
+                - label_box["x2"],
+            )
+
+            score = (
+                dy * 2
+                + gap
+            )
+
+        # ----------------------------------------
+        # Value directly below
+        # ----------------------------------------
+
+        elif candidate_box["cy"] > label_box["cy"]:
+
+            horizontal_alignment = abs(
+                candidate_box["cx"]
+                - label_box["cx"]
+            )
+
+            score = (
+                dy * 2
+                + horizontal_alignment
+                + 80
+            )
+
+        if score < 999999:
+            candidates.append(
+                (
+                    score,
+                    value,
+                )
+            )
+
+    if candidates:
+        candidates.sort(
+            key=lambda x: x[0]
+        )
+
+        return candidates[0][1]
 
     return None
 
 
 # ============================================================
-# LICENSE
+# MRP FROM DETECTIONS
 # ============================================================
 
-def _extract_license(text: str) -> str | None:
+def _extract_mrp_from_detections(
+    detections: list[dict[str, Any]]
+) -> str | None:
+
+    # Explicit MRP detections first.
+    for item in detections:
+
+        value = _extract_mrp(
+            item["text"]
+        )
+
+        if value:
+            return value
+
+    mrp_labels = [
+        r"\bMRP\b",
+        r"\bMAXIMUM\s+RETAIL\s+PRICE\b",
+    ]
+
+    for i, item in enumerate(
+        detections
+    ):
+
+        if not _matches_any(
+            item["text"],
+            mrp_labels,
+        ):
+            continue
+
+        value = _find_nearby_value(
+            detections,
+            i,
+            _extract_mrp,
+            max_vertical_distance=240,
+        )
+
+        if value:
+            return value
+
+        # Sometimes value is just Rs 10.
+        value = _find_nearby_value(
+            detections,
+            i,
+            _extract_price_with_currency,
+            max_vertical_distance=240,
+        )
+
+        if value:
+            return value
+
+    return None
+
+
+# ============================================================
+# QUANTITY
+# ============================================================
+
+def _extract_quantity_from_detections(
+    detections: list[dict[str, Any]]
+) -> str | None:
+
+    labels = [
+        r"\bNET\s+QUANTITY\b",
+        r"\bNET\s+WEIGHT\b",
+        r"\bNET\s+WT\b",
+        r"\bNET\s+QTY\b",
+        r"\bN\.?\s*QTY\b",
+        r"\bNET\b",
+    ]
+
+    for i, item in enumerate(
+        detections
+    ):
+
+        if not _matches_any(
+            item["text"],
+            labels,
+        ):
+            continue
+
+        # Direct value.
+        value = _extract_weight(
+            item["text"]
+        )
+
+        if value:
+            return value
+
+        # Nearby value.
+        value = _find_nearby_value(
+            detections,
+            i,
+            _extract_weight,
+            max_vertical_distance=220,
+        )
+
+        if value:
+            return value
+
+    # Global fallback.
+    for item in detections:
+
+        value = _extract_weight(
+            item["text"]
+        )
+
+        if value:
+            return value
+
+    return None
+
+
+# ============================================================
+# BATCH / LOT
+# ============================================================
+
+def _is_date_like(value: str) -> bool:
+
+    if re.fullmatch(
+        DATE_PATTERN,
+        value,
+        re.IGNORECASE,
+    ):
+        return True
+
+    if re.fullmatch(
+        MONTH_YEAR_PATTERN,
+        value,
+        re.IGNORECASE,
+    ):
+        return True
+
+    return False
+
+
+def _extract_batch(text: str) -> str | None:
+
+    text = _clean_text(text)
+
+    explicit = re.search(
+        r"\b(?:BATCH|LOT)"
+        r"\s*(?:NO|NUMBER|CODE)?\.?"
+        r"\s*[:\-]?\s*"
+        r"([A-Z0-9][A-Z0-9./\-_]{2,40})",
+        text,
+        re.IGNORECASE,
+    )
+
+    if explicit:
+
+        value = explicit.group(1).strip(
+            " .,:;"
+        )
+
+        if (
+            len(value) >= 3
+            and not _is_date_like(value)
+        ):
+            return value
+
+    # If the detection itself is a batch-like code.
+    candidate = text.strip(
+        " .,:;"
+    )
+
+    if (
+        3 <= len(candidate) <= 40
+        and any(
+            c.isdigit()
+            for c in candidate
+        )
+        and re.fullmatch(
+            BATCH_PATTERN,
+            candidate,
+            re.IGNORECASE,
+        )
+        and not _is_date_like(candidate)
+    ):
+        return candidate
+
+    return None
+
+
+def _extract_batch_from_detections(
+    detections: list[dict[str, Any]]
+) -> str | None:
+
+    labels = [
+        r"\bBATCH\b",
+        r"\bLOT\b",
+        r"\bLOT\s+NO\b",
+        r"\bBATCH\s+NO\b",
+    ]
+
+    for i, item in enumerate(
+        detections
+    ):
+
+        if not _matches_any(
+            item["text"],
+            labels,
+        ):
+            continue
+
+        value = _extract_batch(
+            item["text"]
+        )
+
+        if value:
+            return value
+
+        value = _find_nearby_value(
+            detections,
+            i,
+            _extract_batch,
+            max_vertical_distance=200,
+        )
+
+        if value:
+            return value
+
+    # Explicit full-text fallback.
+    full_text = " ".join(
+        item["text"]
+        for item in detections
+    )
+
+    match = re.search(
+        r"\b(?:BATCH|LOT)"
+        r"\s*(?:NO|NUMBER|CODE)?\.?"
+        r"\s*[:\-]?\s*"
+        r"([A-Z0-9][A-Z0-9./\-_]{2,40})",
+        full_text,
+        re.IGNORECASE,
+    )
+
+    if match:
+        value = match.group(1)
+
+        if not _is_date_like(value):
+            return value
+
+    return None
+
+
+# ============================================================
+# DATE OF MANUFACTURE
+# ============================================================
+
+MANUFACTURE_LABELS = [
+    r"\bDATE\s+OF\s+MANUFACTURE\b",
+    r"\bDATE\s+OF\s+MFG\b",
+    r"\bMANUFACTURED\s+ON\b",
+    r"\bMFG\b",
+    r"\bMFD\b",
+    r"\bDOM\b",
+    r"\bPKD\b",
+    r"\bPACKED\s+ON\b",
+]
+
+
+def _extract_manufacture_date(
+    detections: list[dict[str, Any]]
+) -> str | None:
+
+    for i, item in enumerate(
+        detections
+    ):
+
+        if not _matches_any(
+            item["text"],
+            MANUFACTURE_LABELS,
+        ):
+            continue
+
+        value = _extract_any_date(
+            item["text"]
+        )
+
+        if value:
+            return value
+
+        value = _find_nearby_value(
+            detections,
+            i,
+            _extract_any_date,
+            max_vertical_distance=240,
+        )
+
+        if value:
+            return value
+
+    return None
+
+
+# ============================================================
+# EXPIRY / USE BY
+# ============================================================
+
+EXPIRY_LABELS = [
+    r"\bUSE\s+BY\b",
+    r"\bUSE\s+BEFORE\b",
+    r"\bEXPIRY\b",
+    r"\bEXP\b",
+    r"\bEXPIRY\s+DATE\b",
+    r"\bDATE\s+OF\s+EXPIRY\b",
+    r"\bDATE\s+OF\s+EXP\b",
+    r"\bBEST\s+BEFORE\b",
+]
+
+
+def _extract_use_by_date(
+    detections: list[dict[str, Any]]
+) -> str | None:
+
+    for i, item in enumerate(
+        detections
+    ):
+
+        if not _matches_any(
+            item["text"],
+            EXPIRY_LABELS,
+        ):
+            continue
+
+        value = _extract_any_date(
+            item["text"]
+        )
+
+        if value:
+            return value
+
+        value = _find_nearby_value(
+            detections,
+            i,
+            _extract_any_date,
+            max_vertical_distance=260,
+        )
+
+        if value:
+            return value
+
+    return None
+
+
+# ============================================================
+# COMPANY / ROLE EXTRACTION
+# ============================================================
+
+ROLE_LABELS = {
+    "manufacturer": [
+        r"\bMANUFACTURED\s+BY\b",
+        r"\bMANUFACTURER\b",
+        r"\bMFD\s+BY\b",
+    ],
+    "packer": [
+        r"\bPACKED\s+BY\b",
+        r"\bPACKED\s+AT\b",
+        r"\bPACKER\b",
+    ],
+    "marketer": [
+        r"\bMARKETED\s+BY\b",
+        r"\bMARKETER\b",
+    ],
+    "importer": [
+        r"\bIMPORTED\s+BY\b",
+        r"\bIMPORTER\b",
+    ],
+}
+
+
+COMPANY_STOP_LABELS = [
+    r"\bMANUFACTURED\s+BY\b",
+    r"\bMANUFACTURER\b",
+    r"\bMFD\s+BY\b",
+    r"\bPACKED\s+BY\b",
+    r"\bPACKED\s+AT\b",
+    r"\bPACKER\b",
+    r"\bMARKETED\s+BY\b",
+    r"\bMARKETER\b",
+    r"\bIMPORTED\s+BY\b",
+    r"\bIMPORTER\b",
+    r"\bBATCH\b",
+    r"\bLOT\b",
+    r"\bMRP\b",
+    r"\bNET\s+(?:QUANTITY|WEIGHT|QTY)\b",
+    r"\bFSSAI\b",
+    r"\bLIC\.?\s*NO\b",
+    r"\bDATE\b",
+    r"\bMFG\b",
+    r"\bMFD\b",
+    r"\bPKD\b",
+    r"\bEXPIRY\b",
+    r"\bUSE\s+BY\b",
+    r"\bBEST\s+BEFORE\b",
+    r"\bCUSTOMER\s+CARE\b",
+    r"\bCONSUMER\s+CARE\b",
+    r"\bINGREDIENTS?\b",
+    r"\bNUTRITION\b",
+]
+
+
+def _looks_like_company(text: str) -> bool:
+
+    text_upper = text.upper()
+
+    company_terms = [
+        "PVT",
+        "PRIVATE",
+        "LTD",
+        "LIMITED",
+        "LLP",
+        "INC",
+        "CORP",
+        "CORPORATION",
+        "COMPANY",
+        "CO.",
+        "FOODS",
+        "FOOD",
+        "INDUSTRIES",
+        "ENTERPRISES",
+        "INTERNATIONAL",
+        "INDIA",
+        "TRADERS",
+        "MANUFACTURING",
+        "BAKERS",
+        "NUTRI",
+    ]
+
+    return any(
+        term in text_upper
+        for term in company_terms
+    )
+
+
+def _extract_company_after_label(
+    detections: list[dict[str, Any]],
+    label_patterns: list[str],
+) -> str | None:
+
+    for i, label in enumerate(
+        detections
+    ):
+
+        if not _matches_any(
+            label["text"],
+            label_patterns,
+        ):
+            continue
+
+        label_box = label.get("_bbox")
+
+        # ----------------------------------------
+        # Case 1:
+        # "MARKETED BY: PepsiCo India..."
+        # in same OCR detection.
+        # ----------------------------------------
+
+        for pattern in label_patterns:
+
+            match = re.search(
+                pattern
+                + r"\s*[:\-]?\s*(.+)$",
+                label["text"],
+                re.IGNORECASE,
+            )
+
+            if match:
+
+                candidate = _clean_text(
+                    match.group(1)
+                )
+
+                if (
+                    candidate
+                    and len(candidate) >= 3
+                    and not _matches_any(
+                        candidate,
+                        COMPANY_STOP_LABELS,
+                    )
+                ):
+                    return candidate
+
+        if not label_box:
+            continue
+
+        candidates = []
+
+        for j, candidate in enumerate(
+            detections
+        ):
+
+            if j == i:
+                continue
+
+            box = candidate.get("_bbox")
+
+            if not box:
+                continue
+
+            text = candidate["text"].strip()
+
+            if not text:
+                continue
+
+            if _matches_any(
+                text,
+                COMPANY_STOP_LABELS,
+            ):
+                continue
+
+            # Only look after label.
+            if box["cy"] < label_box["cy"] - 20:
+                continue
+
+            dy = (
+                box["cy"]
+                - label_box["cy"]
+            )
+
+            if dy > 260:
+                continue
+
+            dx = (
+                box["cx"]
+                - label_box["cx"]
+            )
+
+            # Same line is strongest.
+            if _same_line(
+                label,
+                candidate,
+            ):
+
+                if dx < -80:
+                    continue
+
+                score = (
+                    abs(dy) * 2
+                    + max(0, box["x1"] - label_box["x2"])
+                )
+
+            else:
+
+                score = (
+                    dy * 2
+                    + abs(dx) * 0.5
+                    + 80
+                )
+
+            if _looks_like_company(text):
+                score -= 100
+
+            candidates.append(
+                (
+                    score,
+                    box["cy"],
+                    box["cx"],
+                    text,
+                )
+            )
+
+        if candidates:
+
+            candidates.sort(
+                key=lambda x: x[0]
+            )
+
+            # Take the best candidate first.
+            best = candidates[0][3]
+
+            if len(best) >= 3:
+                return _clean_text(best)
+
+    return None
+
+
+def _extract_manufacturer(
+    detections: list[dict[str, Any]]
+) -> str | None:
+
+    return _extract_company_after_label(
+        detections,
+        ROLE_LABELS["manufacturer"],
+    )
+
+
+def _extract_packer(
+    detections: list[dict[str, Any]]
+) -> str | None:
+
+    return _extract_company_after_label(
+        detections,
+        ROLE_LABELS["packer"],
+    )
+
+
+def _extract_marketer(
+    detections: list[dict[str, Any]]
+) -> str | None:
+
+    return _extract_company_after_label(
+        detections,
+        ROLE_LABELS["marketer"],
+    )
+
+
+def _extract_importer(
+    detections: list[dict[str, Any]]
+) -> str | None:
+
+    return _extract_company_after_label(
+        detections,
+        ROLE_LABELS["importer"],
+    )
+
+
+# ============================================================
+# ADDRESS
+# ============================================================
+
+def _looks_like_address(text: str) -> bool:
+
+    text_upper = text.upper()
+
+    strong_keywords = [
+        "ROAD",
+        "STREET",
+        "LANE",
+        "NAGAR",
+        "COLONY",
+        "INDUSTRIAL",
+        "ESTATE",
+        "PLOT",
+        "SECTOR",
+        "DISTRICT",
+        "STATE",
+        "HARYANA",
+        "WEST BENGAL",
+        "MAHARASHTRA",
+        "DELHI",
+        "KARNATAKA",
+        "TAMIL NADU",
+        "UTTAR PRADESH",
+        "GUJARAT",
+        "RAJASTHAN",
+        "INDIA",
+        "PIN",
+        "P.O.",
+        "POST",
+    ]
+
+    if any(
+        keyword in text_upper
+        for keyword in strong_keywords
+    ):
+        return True
+
+    if re.search(
+        PIN_PATTERN,
+        text,
+    ):
+        return True
+
+    # Address-like combination:
+    # contains number + several words.
+    if (
+        re.search(r"\d", text)
+        and len(text.split()) >= 3
+    ):
+        return True
+
+    return False
+
+
+def _extract_address_after_label(
+    detections: list[dict[str, Any]],
+    labels: list[str],
+) -> str | None:
+
+    for i, item in enumerate(
+        detections
+    ):
+
+        if not _matches_any(
+            item["text"],
+            labels,
+        ):
+            continue
+
+        box = item.get("_bbox")
+
+        if not box:
+            continue
+
+        candidates = []
+
+        for j, candidate in enumerate(
+            detections
+        ):
+
+            if j == i:
+                continue
+
+            candidate_box = candidate.get(
+                "_bbox"
+            )
+
+            if not candidate_box:
+                continue
+
+            if (
+                candidate_box["cy"]
+                < box["cy"] - 20
+            ):
+                continue
+
+            dy = (
+                candidate_box["cy"]
+                - box["cy"]
+            )
+
+            if dy > 320:
+                continue
+
+            text = candidate["text"].strip()
+
+            if not text:
+                continue
+
+            if _matches_any(
+                text,
+                COMPANY_STOP_LABELS,
+            ):
+                continue
+
+            if _looks_like_address(text):
+
+                score = (
+                    dy
+                    + abs(
+                        candidate_box["cx"]
+                        - box["cx"]
+                    ) * 0.3
+                )
+
+                candidates.append(
+                    (
+                        score,
+                        candidate_box["cy"],
+                        candidate_box["cx"],
+                        text,
+                    )
+                )
+
+        if candidates:
+
+            candidates.sort(
+                key=lambda x: x[0]
+            )
+
+            selected = [
+                item[3]
+                for item in candidates[:5]
+            ]
+
+            return _clean_text(
+                " ".join(selected)
+            )
+
+    return None
+
+
+# ============================================================
+# FSSAI / LICENCE
+# ============================================================
+
+def _extract_license(
+    text: str
+) -> str | None:
 
     patterns = [
-
-        r"\bLIC\.?\s*NO\.?\s*[:\-]?\s*"
-        r"(\d{8,20})",
-
-        r"\bLICENSE\s*"
-        r"(?:NO|NUMBER)?\.?\s*[:\-]?\s*"
-        r"(\d{8,20})",
-
-        r"\bFSSAI\s*"
-        r"(?:LIC(?:ENSE)?\.?\s*)?"
-        r"(?:NO\.?)?\s*[:\-]?\s*"
-        r"(\d{8,20})",
+        r"\bLIC\.?\s*NO\.?\s*[:\-]?\s*(\d{14})",
+        r"\bLICENSE\s*(?:NO|NUMBER)?\.?\s*[:\-]?\s*(\d{14})",
+        r"\bFSSAI\s*(?:LIC(?:ENSE)?\.?\s*)?(?:NO\.?)?\s*[:\-]?\s*(\d{14})",
     ]
 
     for pattern in patterns:
@@ -434,897 +1468,103 @@ def _extract_all_license_numbers(
     detections: list[dict[str, Any]]
 ) -> list[str]:
 
-    full_text = " ".join(
-        item["text"]
-        for item in detections
-    )
-
     numbers = []
-
-    patterns = [
-
-        r"\bLIC\.?\s*NO\.?\s*[:\-]?\s*"
-        r"(\d{8,20})",
-
-        r"\bLICENSE\s*"
-        r"(?:NO|NUMBER)?\.?\s*[:\-]?\s*"
-        r"(\d{8,20})",
-
-        r"\bFSSAI\s*"
-        r"(?:LIC(?:ENSE)?\.?\s*)?"
-        r"(?:NO\.?)?\s*[:\-]?\s*"
-        r"(\d{8,20})",
-    ]
-
-    for pattern in patterns:
-
-        for match in re.finditer(
-            pattern,
-            full_text,
-            re.IGNORECASE,
-        ):
-
-            value = match.group(1)
-
-            if value not in numbers:
-                numbers.append(value)
 
     for item in detections:
 
-        value = _extract_license(
-            item["text"]
-        )
+        text = item["text"]
 
-        if value and value not in numbers:
-            numbers.append(value)
+        # Explicit licence context.
+        for pattern in (
+            r"\bLIC\.?\s*NO\.?\s*[:\-]?\s*(\d{14})",
+            r"\bLICENSE\s*(?:NO|NUMBER)?\.?\s*[:\-]?\s*(\d{14})",
+            r"\bFSSAI\s*(?:LIC(?:ENSE)?\.?\s*)?(?:NO\.?)?\s*[:\-]?\s*(\d{14})",
+        ):
+
+            for match in re.finditer(
+                pattern,
+                text,
+                re.IGNORECASE,
+            ):
+
+                number = match.group(1)
+
+                if number not in numbers:
+                    numbers.append(number)
 
     return numbers
 
 
 # ============================================================
-# SPATIAL HELPERS
+# COMPANY <-> FSSAI ASSOCIATION
 # ============================================================
 
-def _find_nearby_value(
-    detections: list[dict[str, Any]],
-    label_index: int,
-    extractor,
-    max_vertical_distance: float = 180,
-) -> str | None:
+def _extract_license_associations(
+    detections: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
 
-    label = detections[label_index]
+    associations = []
 
-    value = extractor(
-        label["text"]
-    )
-
-    if value:
-        return value
-
-    label_bbox = label.get("_bbox")
-
-    if not label_bbox:
-        return None
-
-    candidates = []
-
-    for i, candidate in enumerate(
+    for i, item in enumerate(
         detections
     ):
 
-        if i == label_index:
-            continue
-
-        candidate_bbox = candidate.get(
-            "_bbox"
-        )
-
-        if not candidate_bbox:
-            continue
-
-        vertical_distance = abs(
-            candidate_bbox["cy"]
-            - label_bbox["cy"]
-        )
-
-        horizontal_distance = (
-            candidate_bbox["cx"]
-            - label_bbox["cx"]
-        )
-
-        if (
-            vertical_distance
-            > max_vertical_distance
-        ):
-            continue
-
-        candidate_value = extractor(
-            candidate["text"]
-        )
-
-        if not candidate_value:
-            continue
-
-        # Same line / value to right.
-        if (
-            vertical_distance
-            <= max(
-                25,
-                label_bbox["height"] * 1.5,
-            )
-            and horizontal_distance > -30
-        ):
-
-            score = (
-                vertical_distance
-                + max(
-                    0,
-                    100 - horizontal_distance,
-                )
-            )
-
-            candidates.append(
-                (
-                    score,
-                    candidate_value,
-                )
-            )
-
-        # Value below label.
-        elif (
-            candidate_bbox["cy"]
-            > label_bbox["cy"]
-            and vertical_distance
-            <= max_vertical_distance
-        ):
-
-            score = (
-                vertical_distance
-                + 100
-            )
-
-            candidates.append(
-                (
-                    score,
-                    candidate_value,
-                )
-            )
-
-    if candidates:
-
-        candidates.sort(
-            key=lambda item: item[0]
-        )
-
-        return candidates[0][1]
-
-    return None
-
-
-# ============================================================
-# MRP
-# ============================================================
-
-def _extract_mrp_from_detections(
-    detections: list[dict[str, Any]]
-) -> str | None:
-
-    full_text = " ".join(
-        item["text"]
-        for item in detections
-    )
-
-    value = _extract_mrp(
-        full_text
-    )
-
-    if value:
-        return value
-
-    for item in detections:
-
-        value = _extract_mrp(
+        license_number = _extract_license(
             item["text"]
         )
 
-        if value:
-            return value
-
-    mrp_label_pattern = (
-        r"\bM\.?\s*R\.?\s*P\.?\b"
-        r"|\bM\s+R\s+P\b"
-    )
-
-    for i, item in enumerate(
-        detections
-    ):
-
-        if not re.search(
-            mrp_label_pattern,
-            item["text"],
-            re.IGNORECASE,
-        ):
+        if not license_number:
             continue
 
-        value = _find_nearby_value(
-            detections,
-            i,
-            _extract_mrp,
-            max_vertical_distance=220,
-        )
+        box = item.get("_bbox")
 
-        if value:
-            return value
-
-    return None
-
-
-# ============================================================
-# QUANTITY
-# ============================================================
-
-def _extract_quantity_from_detections(
-    detections: list[dict[str, Any]]
-) -> str | None:
-
-    quantity_labels = [
-
-        r"\bNET\s+QTY\b",
-        r"\bNET\s+QUANTITY\b",
-        r"\bNET\s+WT\b",
-        r"\bNET\s+WEIGHT\b",
-        r"\bNET\b",
-        r"\bWEIGHT\b",
-    ]
-
-    for i, item in enumerate(
-        detections
-    ):
-
-        if any(
-            re.search(
-                pattern,
-                item["text"],
-                re.IGNORECASE,
-            )
-            for pattern in quantity_labels
-        ):
-
-            value = _find_nearby_value(
-                detections,
-                i,
-                _extract_weight,
-                max_vertical_distance=220,
-            )
-
-            if value:
-                return value
-
-    full_text = " ".join(
-        item["text"]
-        for item in detections
-    )
-
-    value = _extract_weight(
-        full_text
-    )
-
-    if value:
-        return value
-
-    return None
-
-
-# ============================================================
-# BATCH / LOT
-# ============================================================
-
-def _extract_batch_from_detections(
-    detections: list[dict[str, Any]]
-) -> str | None:
-
-    for i, item in enumerate(
-        detections
-    ):
-
-        if re.search(
-            r"\bBATCH\s*(?:NO|NUMBER|CODE)?",
-            item["text"],
-            re.IGNORECASE,
-        ):
-
-            value = _find_nearby_value(
-                detections,
-                i,
-                _extract_batch,
-                max_vertical_distance=180,
-            )
-
-            if value:
-                return value
-
-    for i, item in enumerate(
-        detections
-    ):
-
-        if re.search(
-            r"\bLOT\s*(?:NO|NUMBER|CODE)?",
-            item["text"],
-            re.IGNORECASE,
-        ):
-
-            value = _find_nearby_value(
-                detections,
-                i,
-                _extract_batch,
-                max_vertical_distance=180,
-            )
-
-            if value:
-                return value
-
-    full_text = " ".join(
-        item["text"]
-        for item in detections
-    )
-
-    explicit_patterns = [
-
-        r"\bBATCH\s*(?:NO|NUMBER|CODE)?\.?"
-        r"\s*[:\-]?\s*"
-        r"([A-Z0-9][A-Z0-9/\-]{3,30})",
-
-        r"\bLOT\s*(?:NO|NUMBER|CODE)?\.?"
-        r"\s*[:\-]?\s*"
-        r"([A-Z0-9][A-Z0-9/\-]{3,30})",
-    ]
-
-    for pattern in explicit_patterns:
-
-        match = re.search(
-            pattern,
-            full_text,
-            re.IGNORECASE,
-        )
-
-        if match:
-
-            value = match.group(1)
-
-            if not re.fullmatch(
-                DATE_PATTERN,
-                value,
-                re.IGNORECASE,
-            ):
-                return value
-
-    return None
-
-
-# ============================================================
-# DATE OF MANUFACTURE
-# ============================================================
-
-def _extract_manufacture_date(
-    detections: list[dict[str, Any]]
-) -> str | None:
-
-    manufacture_patterns = [
-
-        r"DATE\s+OF\s+MANUFACTURE",
-        r"DATE\s+OF\s+MFG",
-        r"MANUFACTURE",
-        r"MANUFACTUR",
-        r"\bMFG\b",
-        r"\bMFD\b",
-        r"\bPKD\b",
-        r"\bPACKED\s+ON\b",
-    ]
-
-    for i, item in enumerate(
-        detections
-    ):
-
-        if any(
-            re.search(
-                pattern,
-                item["text"],
-                re.IGNORECASE,
-            )
-            for pattern in manufacture_patterns
-        ):
-
-            value = _extract_date(
-                item["text"]
-            )
-
-            if value:
-                return value
-
-            value = _find_nearby_value(
-                detections,
-                i,
-                _extract_date,
-                max_vertical_distance=220,
-            )
-
-            if value:
-                return value
-
-    full_text = " ".join(
-        item["text"]
-        for item in detections
-    )
-
-    patterns = [
-
-        r"DATE\s+OF\s+MANUFACTURE"
-        r"\s*[:\-]?\s*("
-        + DATE_PATTERN
-        + r")",
-
-        r"DATE\s+OF\s+MFG"
-        r"\s*[:\-]?\s*("
-        + DATE_PATTERN
-        + r")",
-
-        r"\bMFD\b"
-        r"\s*[:\-]?\s*("
-        + DATE_PATTERN
-        + r")",
-
-        r"\bPKD\b"
-        r"\s*[:\-]?\s*("
-        + DATE_PATTERN
-        + r")",
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            full_text,
-            re.IGNORECASE,
-        )
-
-        if match:
-            return match.group(1)
-
-    return None
-
-
-# ============================================================
-# EXPIRY / USE-BY / BEST-BEFORE
-# ============================================================
-
-def _extract_use_by_date(
-    detections: list[dict[str, Any]]
-) -> str | None:
-
-    expiry_patterns = [
-
-        r"\bUSE\s+BY\b",
-        r"\bUSE\s+BEFORE\b",
-        r"\bEXPIRY\b",
-        r"\bEXPIRY\s+DATE\b",
-        r"\bDATE\s+OF\s+EXPIRY\b",
-        r"\bDATE\s+OF\s+EXP\b",
-        r"\bBEST\s+BEFORE\b",
-        r"\bBEST\s+BEFORE\s+DATE\b",
-    ]
-
-    for i, item in enumerate(
-        detections
-    ):
-
-        if any(
-            re.search(
-                pattern,
-                item["text"],
-                re.IGNORECASE,
-            )
-            for pattern in expiry_patterns
-        ):
-
-            value = _extract_date(
-                item["text"]
-            )
-
-            if value:
-                return value
-
-            value = _find_nearby_value(
-                detections,
-                i,
-                _extract_date,
-                max_vertical_distance=240,
-            )
-
-            if value:
-                return value
-
-            # Some products use month/year.
-            value = _find_nearby_value(
-                detections,
-                i,
-                _extract_month_year,
-                max_vertical_distance=240,
-            )
-
-            if value:
-                return value
-
-    full_text = " ".join(
-        item["text"]
-        for item in detections
-    )
-
-    full_text = _normalize_ocr_text(
-        full_text
-    )
-
-    patterns = [
-
-        r"DATE\s+OF\s+EXPIRY"
-        r"\s*[:\-]?\s*("
-        + DATE_PATTERN
-        + r")",
-
-        r"EXPIRY\s+DATE"
-        r"\s*[:\-]?\s*("
-        + DATE_PATTERN
-        + r")",
-
-        r"USE\s+BY"
-        r"\s*[:\-]?\s*("
-        + DATE_PATTERN
-        + r")",
-
-        r"BEST\s+BEFORE"
-        r"\s*[:\-]?\s*("
-        + DATE_PATTERN
-        + r")",
-
-        r"EXPIRY"
-        r"\s*[:\-]?\s*("
-        + DATE_PATTERN
-        + r")",
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            full_text,
-            re.IGNORECASE,
-        )
-
-        if match:
-            return match.group(1)
-
-    return None
-
-
-# ============================================================
-# MANUFACTURER / PACKER / IMPORTER
-# ============================================================
-
-def _extract_company_after_label(
-    detections: list[dict[str, Any]],
-    label_patterns: list[str],
-) -> str | None:
-
-    stop_patterns = [
-
-        r"\bMARKETED\s+BY\b",
-        r"\bMANUFACTURED\s+BY\b",
-        r"\bMANUFACTURER\b",
-        r"\bPACKED\s+BY\b",
-        r"\bPACKER\b",
-        r"\bIMPORTER\b",
-
-        r"\bBATCH\b",
-        r"\bLOT\b",
-        r"\bDATE\b",
-        r"\bUSE\s+BY\b",
-        r"\bEXPIRY\b",
-        r"\bMRP\b",
-        r"\bLIC\.?\s*NO\b",
-        r"\bFSSAI\b",
-        r"\bNET\s+(?:QTY|QUANTITY|WEIGHT)\b",
-        r"\bINGREDIENT\b",
-        r"\bCOMMODITY\b",
-        r"\bCUSTOMER\s+CARE\b",
-    ]
-
-    for i, item in enumerate(
-        detections
-    ):
-
-        if not any(
-            re.search(
-                pattern,
-                item["text"],
-                re.IGNORECASE,
-            )
-            for pattern in label_patterns
-        ):
-            continue
-
-        label_bbox = item.get(
-            "_bbox"
-        )
-
-        if not label_bbox:
-            continue
-
-        parts = []
+        nearest_company = None
+        nearest_distance = float("inf")
 
         for j, candidate in enumerate(
             detections
         ):
 
-            if j == i:
+            if i == j:
                 continue
 
-            candidate_bbox = candidate.get(
+            candidate_box = candidate.get(
                 "_bbox"
             )
 
-            if not candidate_bbox:
-                continue
-
-            if (
-                candidate_bbox["cy"]
-                < label_bbox["cy"] - 25
-            ):
-                continue
-
-            distance = (
-                candidate_bbox["cy"]
-                - label_bbox["cy"]
-            )
-
-            if distance > 280:
-                continue
-
-            candidate_text = (
-                candidate["text"].strip()
-            )
-
-            if not candidate_text:
-                continue
-
-            if any(
-                re.search(
-                    pattern,
-                    candidate_text,
-                    re.IGNORECASE,
-                )
-                for pattern in stop_patterns
-            ):
-                continue
-
-            if re.fullmatch(
-                r"[0-9.\s%]+",
-                candidate_text,
-            ):
-                continue
-
-            parts.append(
-                (
-                    candidate_bbox["cy"],
-                    candidate_bbox["cx"],
-                    candidate_text,
-                )
-            )
-
-        if parts:
-
-            parts.sort(
-                key=lambda x: (
-                    x[0],
-                    x[1],
-                )
-            )
-
-            text = " ".join(
-                part[2]
-                for part in parts[:6]
-            )
-
-            text = _clean_text(text)
-
-            if len(text) >= 5:
-                return text
-
-    return None
-
-
-def _extract_manufacturer(
-    detections: list[dict[str, Any]]
-) -> str | None:
-
-    return _extract_company_after_label(
-        detections,
-        [
-            r"\bMANUFACTURED\s+BY\b",
-            r"\bMANUFACTURER\b",
-            r"\bMFD\s+BY\b",
-        ],
-    )
-
-
-def _extract_packer(
-    detections: list[dict[str, Any]]
-) -> str | None:
-
-    return _extract_company_after_label(
-        detections,
-        [
-            r"\bPACKED\s+BY\b",
-            r"\bPACKER\b",
-            r"\bPACKED\s+AT\b",
-        ],
-    )
-
-
-def _extract_marketer(
-    detections: list[dict[str, Any]]
-) -> str | None:
-
-    return _extract_company_after_label(
-        detections,
-        [
-            r"\bMARKETED\s+BY\b",
-            r"\bMARKETER\b",
-        ],
-    )
-
-
-def _extract_importer(
-    detections: list[dict[str, Any]]
-) -> str | None:
-
-    return _extract_company_after_label(
-        detections,
-        [
-            r"\bIMPORTED\s+BY\b",
-            r"\bIMPORTER\b",
-        ],
-    )
-
-
-# ============================================================
-# ADDRESS
-# ============================================================
-
-def _looks_like_address(text: str) -> bool:
-
-    text_upper = text.upper()
-
-    address_keywords = [
-        "ROAD",
-        "RD",
-        "STREET",
-        "ST",
-        "LANE",
-        "LN",
-        "NAGAR",
-        "COLONY",
-        "INDUSTRIAL",
-        "ESTATE",
-        "PLOT",
-        "SECTOR",
-        "DISTRICT",
-        "DIST",
-        "STATE",
-        "INDIA",
-        "PIN",
-    ]
-
-    if any(
-        keyword in text_upper
-        for keyword in address_keywords
-    ):
-        return True
-
-    if re.search(
-        PIN_PATTERN,
-        text,
-    ):
-        return True
-
-    return False
-
-
-def _extract_address_after_label(
-    detections: list[dict[str, Any]],
-    labels: list[str],
-) -> str | None:
-
-    for i, item in enumerate(
-        detections
-    ):
-
-        if not any(
-            re.search(
-                label,
-                item["text"],
-                re.IGNORECASE,
-            )
-            for label in labels
-        ):
-            continue
-
-        bbox = item.get("_bbox")
-
-        if not bbox:
-            continue
-
-        candidates = []
-
-        for j, candidate in enumerate(
-            detections
-        ):
-
-            if j == i:
-                continue
-
-            candidate_bbox = candidate.get(
-                "_bbox"
-            )
-
-            if not candidate_bbox:
-                continue
-
-            if (
-                candidate_bbox["cy"]
-                < bbox["cy"] - 20
-            ):
-                continue
-
-            distance = (
-                candidate_bbox["cy"]
-                - bbox["cy"]
-            )
-
-            if distance > 300:
+            if not candidate_box:
                 continue
 
             text = candidate["text"].strip()
 
-            if not text:
-                continue
-
-            if _looks_like_address(
+            if not _looks_like_company(
                 text
             ):
-                candidates.append(
-                    (
-                        candidate_bbox["cy"],
-                        candidate_bbox["cx"],
-                        text,
-                    )
-                )
+                continue
 
-        if candidates:
-
-            candidates.sort(
-                key=lambda x: (
-                    x[0],
-                    x[1],
+            distance = (
+                abs(
+                    candidate_box["cy"]
+                    - box["cy"]
                 )
+                if box
+                else 999999
             )
 
-            return _clean_text(
-                " ".join(
-                    x[2]
-                    for x in candidates[:5]
-                )
-            )
+            if distance < nearest_distance:
 
-    return None
+                nearest_distance = distance
+                nearest_company = text
+
+        associations.append(
+            {
+                "company": nearest_company,
+                "license_number": license_number,
+                "source_detection": i,
+            }
+        )
+
+    return associations
 
 
 # ============================================================
@@ -1335,40 +1575,110 @@ def _extract_consumer_care(
     detections: list[dict[str, Any]]
 ) -> dict[str, Any]:
 
-    full_text = " ".join(
-        item["text"]
-        for item in detections
-    )
-
-    customer_care_patterns = [
+    labels = [
         r"\bCUSTOMER\s+CARE\b",
         r"\bCONSUMER\s+CARE\b",
         r"\bCONSUMER\s+COMPLAINT\b",
-        r"\bTOLL\s+FREE\b",
+        r"\bTOLL\s*FREE\b",
         r"\bHELPLINE\b",
         r"\bHELP\s*LINE\b",
     ]
 
-    found_label = any(
-        re.search(
-            pattern,
-            full_text,
-            re.IGNORECASE,
+    label_indices = []
+
+    for i, item in enumerate(
+        detections
+    ):
+
+        if _matches_any(
+            item["text"],
+            labels,
+        ):
+            label_indices.append(i)
+
+    phones = []
+    emails = []
+
+    # ----------------------------------------
+    # Prefer numbers/emails near customer-care
+    # ----------------------------------------
+
+    for i in label_indices:
+
+        label_box = detections[i].get(
+            "_bbox"
         )
-        for pattern in customer_care_patterns
-    )
 
-    phones = re.findall(
-        PHONE_PATTERN,
-        full_text,
-        re.IGNORECASE,
-    )
+        if not label_box:
+            continue
 
-    emails = re.findall(
-        EMAIL_PATTERN,
-        full_text,
-        re.IGNORECASE,
-    )
+        for candidate in detections:
+
+            candidate_box = candidate.get(
+                "_bbox"
+            )
+
+            if not candidate_box:
+                continue
+
+            dy = abs(
+                candidate_box["cy"]
+                - label_box["cy"]
+            )
+
+            if dy > 280:
+                continue
+
+            phones.extend(
+                re.findall(
+                    PHONE_PATTERN,
+                    candidate["text"],
+                    re.IGNORECASE,
+                )
+            )
+
+            emails.extend(
+                re.findall(
+                    EMAIL_PATTERN,
+                    candidate["text"],
+                    re.IGNORECASE,
+                )
+            )
+
+    # ----------------------------------------
+    # Fallback if label exists but proximity
+    # missed values.
+    # ----------------------------------------
+
+    if label_indices and not phones:
+
+        full_text = " ".join(
+            item["text"]
+            for item in detections
+        )
+
+        phones.extend(
+            re.findall(
+                PHONE_PATTERN,
+                full_text,
+                re.IGNORECASE,
+            )
+        )
+
+    if label_indices and not emails:
+
+        full_text = " ".join(
+            item["text"]
+            for item in detections
+        )
+
+        emails.extend(
+            re.findall(
+                EMAIL_PATTERN,
+                full_text,
+                re.IGNORECASE,
+            )
+        )
 
     phones = list(
         dict.fromkeys(
@@ -1383,7 +1693,9 @@ def _extract_consumer_care(
     )
 
     return {
-        "label_detected": found_label,
+        "label_detected": bool(
+            label_indices
+        ),
         "phone_numbers": phones,
         "email_addresses": emails,
     }
@@ -1397,146 +1709,282 @@ def _extract_country_of_origin(
     detections: list[dict[str, Any]]
 ) -> str | None:
 
-    full_text = " ".join(
-        item["text"]
-        for item in detections
-    )
-
-    patterns = [
-
-        r"COUNTRY\s+OF\s+ORIGIN"
-        r"\s*[:\-]?\s*"
-        r"([A-Za-z][A-Za-z\s]{2,40})",
-
-        r"MADE\s+IN"
-        r"\s*[:\-]?\s*"
-        r"([A-Za-z][A-Za-z\s]{2,40})",
-
-        r"PRODUCT\s+OF"
-        r"\s*[:\-]?\s*"
-        r"([A-Za-z][A-Za-z\s]{2,40})",
+    labels = [
+        r"\bCOUNTRY\s+OF\s+ORIGIN\b",
+        r"\bMADE\s+IN\b",
+        r"\bPRODUCT\s+OF\b",
     ]
 
-    for pattern in patterns:
+    for i, item in enumerate(
+        detections
+    ):
 
-        match = re.search(
-            pattern,
-            full_text,
-            re.IGNORECASE,
-        )
+        if not _matches_any(
+            item["text"],
+            labels,
+        ):
+            continue
 
-        if match:
+        # Same detection.
+        for pattern in labels:
 
-            value = _clean_text(
-                match.group(1)
+            match = re.search(
+                pattern
+                + r"\s*[:\-]?\s*"
+                r"([A-Za-z][A-Za-z\s]{2,40})",
+                item["text"],
+                re.IGNORECASE,
             )
 
-            # Avoid swallowing unrelated fields.
-            value = re.split(
-                r"\b(?:MRP|BATCH|LOT|"
-                r"NET|DATE|EXPIRY|"
-                r"FSSAI|LIC)\b",
-                value,
-                flags=re.IGNORECASE,
-            )[0].strip()
+            if match:
 
-            if value:
-                return value
+                value = _clean_text(
+                    match.group(1)
+                )
+
+                if value:
+                    return value
+
+        # Nearby value.
+        value = _find_nearby_value(
+            detections,
+            i,
+            lambda text: (
+                re.sub(
+                    r"^(?:COUNTRY\s+OF\s+ORIGIN|MADE\s+IN|PRODUCT\s+OF)"
+                    r"\s*[:\-]?\s*",
+                    "",
+                    text,
+                    flags=re.IGNORECASE,
+                ).strip()
+                if re.sub(
+                    r"^(?:COUNTRY\s+OF\s+ORIGIN|MADE\s+IN|PRODUCT\s+OF)"
+                    r"\s*[:\-]?\s*",
+                    "",
+                    text,
+                    flags=re.IGNORECASE,
+                ).strip()
+                else None
+            ),
+            max_vertical_distance=220,
+        )
+
+        if value:
+            return value
 
     return None
 
 
 # ============================================================
-# GENERIC COMMODITY / PRODUCT NAME
+# PRODUCT NAME
 # ============================================================
+
+PRODUCT_EXCLUSION_PATTERNS = [
+    r"\bMRP\b",
+    r"\bNET\b",
+    r"\bQUANTITY\b",
+    r"\bWEIGHT\b",
+    r"\bINGREDIENTS?\b",
+    r"\bNUTRITION(?:AL)?\b",
+    r"\bENERGY\b",
+    r"\bPROTEIN\b",
+    r"\bCARBOHYDRATE\b",
+    r"\bFAT\b",
+    r"\bSUGAR\b",
+    r"\bSALT\b",
+    r"\bSODIUM\b",
+    r"\bMANUFACTURED\b",
+    r"\bMANUFACTURER\b",
+    r"\bMARKETED\b",
+    r"\bPACKED\b",
+    r"\bIMPORTER\b",
+    r"\bCUSTOMER\s+CARE\b",
+    r"\bCONSUMER\s+CARE\b",
+    r"\bFSSAI\b",
+    r"\bLIC\.?\s*NO\b",
+    r"\bBATCH\b",
+    r"\bLOT\b",
+    r"\bUSE\s+BY\b",
+    r"\bEXPIRY\b",
+    r"\bBEST\s+BEFORE\b",
+    r"\bDATE\b",
+    r"\bCOUNTRY\s+OF\s+ORIGIN\b",
+    r"\bMADE\s+IN\b",
+    r"\bMARKETED\s+BY\b",
+    r"\bMANUFACTURED\s+BY\b",
+    r"\bPACKED\s+BY\b",
+]
+
+
+def _is_product_name_candidate(
+    text: str
+) -> bool:
+
+    text = _clean_text(text)
+
+    if len(text) < 2:
+        return False
+
+    if len(text) > 100:
+        return False
+
+    if _matches_any(
+        text,
+        PRODUCT_EXCLUSION_PATTERNS,
+    ):
+        return False
+
+    # Pure numbers are not product names.
+    if re.fullmatch(
+        r"[\d\s./\-]+",
+        text,
+    ):
+        return False
+
+    # Email / phone / licence.
+    if re.search(
+        EMAIL_PATTERN,
+        text,
+        re.IGNORECASE,
+    ):
+        return False
+
+    if re.fullmatch(
+        PHONE_PATTERN,
+        text,
+        re.IGNORECASE,
+    ):
+        return False
+
+    if re.fullmatch(
+        LICENSE_PATTERN,
+        text,
+    ):
+        return False
+
+    return True
+
 
 def _extract_product_name(
     detections: list[dict[str, Any]]
 ) -> str | None:
 
-    product_keywords = [
-
-        "OATS",
-        "WAFERS",
-        "CHIPS",
-        "POTATO CHIPS",
-        "VEGGIE STIX",
-        "BISCUIT",
-        "BISCUITS",
-        "NOODLES",
-        "COOKIES",
-        "JUICE",
-        "DRINK",
-        "SNACK",
-        "CEREAL",
-        "CEREALS",
-        "FLOUR",
-        "RICE",
-        "SUGAR",
-        "SALT",
-        "TEA",
-        "COFFEE",
-        "BREAD",
-        "MILK",
-        "BUTTER",
-        "BISCUIT",
-    ]
-
     candidates = []
 
-    for item in detections:
+    valid_boxes = [
+        d["_bbox"]
+        for d in detections
+        if d.get("_bbox")
+    ]
 
-        text = item["text"].strip()
+    max_height = (
+        max(
+            box["height"]
+            for box in valid_boxes
+        )
+        if valid_boxes
+        else 0
+    )
 
-        if len(text) < 2:
+    max_width = (
+        max(
+            box["width"]
+            for box in valid_boxes
+        )
+        if valid_boxes
+        else 0
+    )
+
+    for index, item in enumerate(
+        detections
+    ):
+
+        text = item["text"]
+
+        if not _is_product_name_candidate(
+            text
+        ):
             continue
 
-        upper = text.upper()
+        box = item.get("_bbox")
 
-        score = 0
+        score = 0.0
 
-        for keyword in product_keywords:
-
-            if keyword in upper:
-                score += 10
-
-        bbox = item.get(
-            "_bbox"
+        # OCR confidence.
+        score += (
+            item["confidence"] * 20
         )
 
-        if bbox:
+        if box:
 
-            if bbox["height"] >= 40:
-                score += 4
+            # Large text is often brand/product text.
+            if max_height > 0:
+                score += (
+                    box["height"]
+                    / max_height
+                ) * 35
 
-            if bbox["width"] >= 150:
-                score += 2
+            if max_width > 0:
+                score += (
+                    box["width"]
+                    / max_width
+                ) * 10
 
-        score += item["confidence"]
+            # Central / upper package area.
+            # We do not assume a fixed image resolution.
+            if box["cy"] >= 0:
+                score += 5
 
-        if score > 0:
-
-            candidates.append(
-                (
-                    score,
-                    text,
-                )
+            # Prominent short-to-medium labels.
+            word_count = len(
+                text.split()
             )
 
-    if candidates:
+            if 1 <= word_count <= 7:
+                score += 12
 
-        candidates.sort(
-            key=lambda x: x[0],
-            reverse=True,
+            # Avoid tiny legal/declaration text.
+            if box["height"] < 12:
+                score -= 15
+
+        # Brand/product-like capitalization.
+        uppercase_ratio = sum(
+            1
+            for c in text
+            if c.isupper()
+        ) / max(
+            1,
+            sum(
+                1
+                for c in text
+                if c.isalpha()
+            ),
         )
 
-        return candidates[0][1]
+        if uppercase_ratio > 0.55:
+            score += 5
 
-    return None
+        candidates.append(
+            (
+                score,
+                index,
+                text,
+            )
+        )
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    return candidates[0][2]
 
 
 # ============================================================
-# GENERIC FIELD FINDER
+# GENERIC LABELLED TEXT
 # ============================================================
 
 def _extract_labelled_text(
@@ -1549,78 +1997,46 @@ def _extract_labelled_text(
         detections
     ):
 
-        if not any(
-            re.search(
-                pattern,
+        if not _matches_any(
+            item["text"],
+            label_patterns,
+        ):
+            continue
+
+        # Same detection.
+        for pattern in label_patterns:
+
+            match = re.search(
+                pattern
+                + r"\s*[:\-]?\s*(.+)$",
                 item["text"],
                 re.IGNORECASE,
             )
-            for pattern in label_patterns
-        ):
-            continue
 
-        bbox = item.get(
-            "_bbox"
+            if match:
+
+                value = _clean_text(
+                    match.group(1)
+                )
+
+                if value:
+                    return value
+
+        value = _find_nearby_value(
+            detections,
+            i,
+            lambda text: (
+                text
+                if len(
+                    _clean_text(text)
+                ) >= 2
+                else None
+            ),
+            max_vertical_distance=max_distance,
         )
 
-        if not bbox:
-            continue
-
-        candidates = []
-
-        for j, candidate in enumerate(
-            detections
-        ):
-
-            if j == i:
-                continue
-
-            candidate_bbox = candidate.get(
-                "_bbox"
-            )
-
-            if not candidate_bbox:
-                continue
-
-            dy = abs(
-                candidate_bbox["cy"]
-                - bbox["cy"]
-            )
-
-            dx = (
-                candidate_bbox["cx"]
-                - bbox["cx"]
-            )
-
-            if dy > max_distance:
-                continue
-
-            if dx < -100:
-                continue
-
-            text = candidate["text"].strip()
-
-            if not text:
-                continue
-
-            score = dy + abs(
-                max(0, -dx)
-            )
-
-            candidates.append(
-                (
-                    score,
-                    text,
-                )
-            )
-
-        if candidates:
-
-            candidates.sort(
-                key=lambda x: x[0]
-            )
-
-            return candidates[0][1]
+        if value:
+            return value
 
     return None
 
@@ -1633,36 +2049,155 @@ def _extract_unit_sale_price(
     detections: list[dict[str, Any]]
 ) -> str | None:
 
-    full_text = " ".join(
-        item["text"]
-        for item in detections
-    )
-
-    patterns = [
-
-        r"(?:UNIT\s+SALE\s+PRICE)"
-        r"\s*[:\-]?\s*"
-        r"(?:₹|Rs\.?|INR)?\s*"
-        r"([0-9]+(?:\.[0-9]{1,2})?)",
-
-        r"(?:SALE\s+PRICE\s+PER)"
-        r"\s*[:\-]?\s*"
-        r"(?:₹|Rs\.?|INR)?\s*"
-        r"([0-9]+(?:\.[0-9]{1,2})?)",
+    labels = [
+        r"\bUNIT\s+SALE\s+PRICE\b",
+        r"\bSALE\s+PRICE\s+PER\b",
+        r"\bUNIT\s+PRICE\b",
+        r"\bPRICE\s+PER\s+UNIT\b",
     ]
 
-    for pattern in patterns:
+    def extract_unit_value(
+        text: str,
+    ) -> str | None:
+
+        pattern = (
+            r"(?:UNIT\s+SALE\s+PRICE|"
+            r"SALE\s+PRICE\s+PER|"
+            r"UNIT\s+PRICE|"
+            r"PRICE\s+PER\s+UNIT)"
+            r"\s*[:\-]?\s*"
+            r"(?:₹|Rs\.?|INR)?\s*"
+            r"([0-9]+(?:\.[0-9]{1,4})?)"
+        )
 
         match = re.search(
             pattern,
-            full_text,
+            text,
             re.IGNORECASE,
         )
 
         if match:
             return match.group(1)
 
+        return None
+
+    for i, item in enumerate(
+        detections
+    ):
+
+        value = extract_unit_value(
+            item["text"]
+        )
+
+        if value:
+            return value
+
+        if _matches_any(
+            item["text"],
+            labels,
+        ):
+
+            value = _find_nearby_value(
+                detections,
+                i,
+                lambda text: (
+                    re.search(
+                        r"(?:₹|Rs\.?|INR)?\s*"
+                        r"([0-9]+(?:\.[0-9]{1,4})?)",
+                        text,
+                        re.IGNORECASE,
+                    ).group(1)
+                    if re.search(
+                        r"(?:₹|Rs\.?|INR)?\s*"
+                        r"([0-9]+(?:\.[0-9]{1,4})?)",
+                        text,
+                        re.IGNORECASE,
+                    )
+                    else None
+                ),
+                max_vertical_distance=220,
+            )
+
+            if value:
+                return value
+
     return None
+
+
+# ============================================================
+# DIMENSIONS
+# ============================================================
+
+def _extract_dimensions(
+    detections: list[dict[str, Any]]
+) -> list[str]:
+
+    dimensions = []
+
+    for item in detections:
+
+        matches = re.findall(
+            DIMENSION_PATTERN,
+            item["text"],
+            re.IGNORECASE,
+        )
+
+        for match in matches:
+
+            if match not in dimensions:
+                dimensions.append(match)
+
+    return dimensions
+
+
+# ============================================================
+# CONFIDENCE HELPERS
+# ============================================================
+
+def _field_confidence(
+    detections: list[dict[str, Any]],
+    value: Any,
+    label_patterns: list[str] | None = None,
+) -> float:
+
+    if value is None:
+        return 0.0
+
+    if not detections:
+        return 0.0
+
+    if not label_patterns:
+        return round(
+            min(
+                1.0,
+                sum(
+                    d["confidence"]
+                    for d in detections
+                )
+                / len(detections),
+            ),
+            3,
+        )
+
+    matching = [
+        d["confidence"]
+        for d in detections
+        if _matches_any(
+            d["text"],
+            label_patterns,
+        )
+    ]
+
+    if matching:
+        return round(
+            min(
+                1.0,
+                max(matching),
+            ),
+            3,
+        )
+
+    return 0.60
 
 
 # ============================================================
@@ -1673,36 +2208,24 @@ def extract_product_information(
     ocr_results: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """
-    Convert PaddleOCR detections into structured product information.
+    Convert PaddleOCR detections into structured
+    SmartLabel AI product information.
 
-    This extraction layer is designed for SmartLabel AI.
+    IMPORTANT:
+    This is an extraction layer.
 
-    It extracts:
-        - Product / commodity name
-        - MRP
-        - Net quantity
-        - Unit sale price
-        - Manufacturer
-        - Manufacturer address
-        - Packer
-        - Packer address
-        - Importer
-        - Importer address
-        - Marketer
-        - Batch / Lot number
-        - Manufacture / packing date
-        - Expiry / Use-by / Best-before
-        - FSSAI licence numbers
-        - Consumer care phone/email
-        - Country of origin
-        - Dimensions
-        - Raw OCR text
-        - OCR evidence
+    It does NOT determine whether the package is
+    legally compliant.
 
-    NOTE:
-    Extraction is NOT legal compliance by itself.
-    The compliance engine must decide whether a declaration
-    is mandatory, applicable, correctly formatted and readable.
+    The downstream compliance engine must evaluate:
+        - applicability
+        - mandatory declarations
+        - correctness
+        - completeness
+        - placement
+        - readability
+        - font size
+        - exceptions
     """
 
     detections = _prepare_detections(
@@ -1727,122 +2250,91 @@ def extract_product_information(
     )
 
     # --------------------------------------------------------
-    # Full OCR text
+    # Raw OCR text
     # --------------------------------------------------------
-
-    full_text = " ".join(
-        item["text"]
-        for item in detections
-    )
 
     clean_text = _clean_text(
-        full_text
-    )
-
-    # --------------------------------------------------------
-    # Core declarations
-    # --------------------------------------------------------
-
-    product_name = (
-        _extract_product_name(
-            detections
-        )
-    )
-
-    mrp = (
-        _extract_mrp_from_detections(
-            detections
-        )
-    )
-
-    net_quantity = (
-        _extract_quantity_from_detections(
-            detections
-        )
-    )
-
-    unit_sale_price = (
-        _extract_unit_sale_price(
-            detections
-        )
-    )
-
-    batch_number = (
-        _extract_batch_from_detections(
-            detections
-        )
-    )
-
-    manufacture_date = (
-        _extract_manufacture_date(
-            detections
-        )
-    )
-
-    use_by_date = (
-        _extract_use_by_date(
-            detections
+        " ".join(
+            item["text"]
+            for item in detections
         )
     )
 
     # --------------------------------------------------------
-    # Manufacturer / Packer / Importer
+    # Extract fields
     # --------------------------------------------------------
 
-    manufacturer = (
-        _extract_manufacturer(
-            detections
-        )
+    product_name = _extract_product_name(
+        detections
     )
 
-    packer = (
-        _extract_packer(
-            detections
-        )
+    generic_name = _extract_labelled_text(
+        detections,
+        [
+            r"\bCOMMON\s+NAME\b",
+            r"\bGENERIC\s+NAME\b",
+            r"\bNAME\s+OF\s+COMMODITY\b",
+            r"\bCOMMODITY\b",
+        ],
     )
 
-    importer = (
-        _extract_importer(
-            detections
-        )
+    mrp = _extract_mrp_from_detections(
+        detections
     )
 
-    marketer = (
-        _extract_marketer(
-            detections
-        )
+    net_quantity = _extract_quantity_from_detections(
+        detections
     )
 
-    manufacturer_address = (
-        _extract_address_after_label(
-            detections,
-            [
-                r"\bMANUFACTURED\s+BY\b",
-                r"\bMANUFACTURER\b",
-                r"\bMFD\s+BY\b",
-            ],
-        )
+    unit_sale_price = _extract_unit_sale_price(
+        detections
     )
 
-    packer_address = (
-        _extract_address_after_label(
-            detections,
-            [
-                r"\bPACKED\s+BY\b",
-                r"\bPACKER\b",
-                r"\bPACKED\s+AT\b",
-            ],
-        )
+    batch_number = _extract_batch_from_detections(
+        detections
     )
 
-    importer_address = (
-        _extract_address_after_label(
-            detections,
-            [
-                r"\bIMPORTED\s+BY\b",
-                r"\bIMPORTER\b",
-            ],
-        )
+    manufacture_date = _extract_manufacture_date(
+        detections
+    )
+
+    use_by_date = _extract_use_by_date(
+        detections
+    )
+
+    manufacturer = _extract_manufacturer(
+        detections
+    )
+
+    packer = _extract_packer(
+        detections
+    )
+
+    marketer = _extract_marketer(
+        detections
+    )
+
+    importer = _extract_importer(
+        detections
+    )
+
+    # --------------------------------------------------------
+    # Addresses
+    # --------------------------------------------------------
+
+    manufacturer_address = _extract_address_after_label(
+        detections,
+        ROLE_LABELS["manufacturer"],
+    )
+
+    packer_address = _extract_address_after_label(
+        detections,
+        ROLE_LABELS["packer"],
+    )
+
+    importer_address = _extract_address_after_label(
+        detections,
+        ROLE_LABELS["importer"],
     )
 
     # --------------------------------------------------------
@@ -1861,18 +2353,22 @@ def extract_product_information(
         else None
     )
 
-    # --------------------------------------------------------
-    # Consumer care
-    # --------------------------------------------------------
-
-    consumer_care = (
-        _extract_consumer_care(
+    license_associations = (
+        _extract_license_associations(
             detections
         )
     )
 
     # --------------------------------------------------------
-    # Country of origin
+    # Consumer care
+    # --------------------------------------------------------
+
+    consumer_care = _extract_consumer_care(
+        detections
+    )
+
+    # --------------------------------------------------------
+    # Country
     # --------------------------------------------------------
 
     country_of_origin = (
@@ -1885,126 +2381,160 @@ def extract_product_information(
     # Dimensions
     # --------------------------------------------------------
 
-    dimensions = []
-
-    for item in detections:
-
-        matches = re.findall(
-            DIMENSION_PATTERN,
-            item["text"],
-            re.IGNORECASE,
-        )
-
-        for match in matches:
-
-            if match not in dimensions:
-                dimensions.append(match)
-
-    # --------------------------------------------------------
-    # Generic commodity description
-    # --------------------------------------------------------
-
-    generic_name = (
-        _extract_labelled_text(
-            detections,
-            [
-                r"\bCOMMON\s+NAME\b",
-                r"\bGENERIC\s+NAME\b",
-                r"\bNAME\s+OF\s+COMMODITY\b",
-                r"\bCOMMODITY\b",
-            ],
-        )
+    dimensions = _extract_dimensions(
+        detections
     )
 
     # --------------------------------------------------------
-    # Quantity validation
+    # Basic validation
     # --------------------------------------------------------
+
+    if mrp:
+
+        try:
+            if float(mrp) <= 0:
+                mrp = None
+        except (
+            ValueError,
+            TypeError,
+        ):
+            mrp = None
 
     if net_quantity:
 
-        if not re.fullmatch(
+        if not re.search(
             WEIGHT_PATTERN,
             net_quantity,
             re.IGNORECASE,
         ):
             net_quantity = None
 
-    # --------------------------------------------------------
-    # MRP validation
-    # --------------------------------------------------------
-
-    if mrp:
-
-        try:
-
-            mrp_value = float(
-                mrp
-            )
-
-            if mrp_value <= 0:
-                mrp = None
-
-        except (
-            ValueError,
-            TypeError,
-        ):
-
-            mrp = None
-
-    # --------------------------------------------------------
-    # Batch validation
-    # --------------------------------------------------------
-
     if batch_number:
 
         if (
-            len(batch_number) < 4
-            or not any(
-                char.isdigit()
-                for char in batch_number
-            )
-            or re.fullmatch(
-                DATE_PATTERN,
-                batch_number,
-                re.IGNORECASE,
-            )
+            len(batch_number) < 3
+            or _is_date_like(batch_number)
         ):
-
             batch_number = None
 
     # --------------------------------------------------------
-    # FSSAI validation
+    # Evidence / field confidence
     # --------------------------------------------------------
 
-    valid_license_numbers = []
+    field_confidence = {
 
-    for number in license_numbers:
+        "product_name": _field_confidence(
+            detections,
+            product_name,
+        ),
 
-        digits = re.sub(
-            r"\D",
-            "",
-            str(number),
-        )
+        "generic_name": _field_confidence(
+            detections,
+            generic_name,
+            [
+                r"\bCOMMON\s+NAME\b",
+                r"\bGENERIC\s+NAME\b",
+                r"\bNAME\s+OF\s+COMMODITY\b",
+                r"\bCOMMODITY\b",
+            ],
+        ),
 
-        if len(digits) == 14:
+        "mrp": _field_confidence(
+            detections,
+            mrp,
+            [
+                r"\bMRP\b",
+                r"\bMAXIMUM\s+RETAIL\s+PRICE\b",
+            ],
+        ),
 
-            if digits not in valid_license_numbers:
-                valid_license_numbers.append(
-                    digits
-                )
+        "net_quantity": _field_confidence(
+            detections,
+            net_quantity,
+            [
+                r"\bNET\b",
+                r"\bNET\s+QUANTITY\b",
+                r"\bNET\s+WEIGHT\b",
+                r"\bN\.?\s*QTY\b",
+            ],
+        ),
 
-    license_numbers = (
-        valid_license_numbers
-    )
+        "manufacturer": _field_confidence(
+            detections,
+            manufacturer,
+            ROLE_LABELS["manufacturer"],
+        ),
 
-    license_number = (
-        license_numbers[0]
-        if license_numbers
-        else None
-    )
+        "packer": _field_confidence(
+            detections,
+            packer,
+            ROLE_LABELS["packer"],
+        ),
+
+        "marketer": _field_confidence(
+            detections,
+            marketer,
+            ROLE_LABELS["marketer"],
+        ),
+
+        "importer": _field_confidence(
+            detections,
+            importer,
+            ROLE_LABELS["importer"],
+        ),
+
+        "batch_number": _field_confidence(
+            detections,
+            batch_number,
+            [
+                r"\bBATCH\b",
+                r"\bLOT\b",
+            ],
+        ),
+
+        "manufacture_date": _field_confidence(
+            detections,
+            manufacture_date,
+            MANUFACTURE_LABELS,
+        ),
+
+        "use_by_date": _field_confidence(
+            detections,
+            use_by_date,
+            EXPIRY_LABELS,
+        ),
+
+        "license_number": _field_confidence(
+            detections,
+            license_number,
+            [
+                r"\bFSSAI\b",
+                r"\bLIC\.?\s*NO\b",
+            ],
+        ),
+
+        "country_of_origin": _field_confidence(
+            detections,
+            country_of_origin,
+            [
+                r"\bCOUNTRY\s+OF\s+ORIGIN\b",
+                r"\bMADE\s+IN\b",
+            ],
+        ),
+
+        "unit_sale_price": _field_confidence(
+            detections,
+            unit_sale_price,
+            [
+                r"\bUNIT\s+SALE\s+PRICE\b",
+                r"\bSALE\s+PRICE\s+PER\b",
+                r"\bUNIT\s+PRICE\b",
+            ],
+        ),
+    }
 
     # --------------------------------------------------------
-    # Return structured information
+    # Return
     # --------------------------------------------------------
 
     return {
@@ -2072,19 +2602,29 @@ def extract_product_information(
         "license_numbers":
             license_numbers,
 
+        "license_associations":
+            license_associations,
+
         # ====================================================
-        # CONSUMER INFORMATION
+        # CONSUMER
         # ====================================================
 
         "consumer_care":
             consumer_care,
 
         # ====================================================
-        # IMPORT INFORMATION
+        # ORIGIN
         # ====================================================
 
         "country_of_origin":
             country_of_origin,
+
+        # ====================================================
+        # EXTRACTION CONFIDENCE
+        # ====================================================
+
+        "field_confidence":
+            field_confidence,
 
         # ====================================================
         # DEBUG / EVIDENCE
